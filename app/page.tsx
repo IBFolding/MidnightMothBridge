@@ -1,11 +1,20 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { BrowserProvider, Contract, JsonRpcProvider, getAddress, isAddress, zeroPadValue } from 'ethers';
+import { BrowserProvider, Contract, JsonRpcProvider, getAddress, zeroPadValue } from 'ethers';
 import { CHAINS, CONTRACTS, UI } from '@/src/lib/constants';
 import { ERC721_ABI, ONFT_ADAPTER_ABI } from '@/src/lib/abi';
 
-type TxPhase = 'idle' | 'switching' | 'scanning' | 'ready' | 'approving' | 'quoting' | 'sending' | 'success' | 'error';
+type TxPhase =
+  | 'idle'
+  | 'switching'
+  | 'scanning'
+  | 'ready'
+  | 'approving'
+  | 'quoting'
+  | 'sending'
+  | 'success'
+  | 'error';
 
 type MothItem = {
   tokenId: bigint;
@@ -14,18 +23,36 @@ type MothItem = {
   name?: string;
 };
 
-const TRANSFER_SIG = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
 function ipfsToHttp(uri: string) {
-  if (!uri) return uri;
+  if (!uri) return '';
   if (uri.startsWith('ipfs://')) return UI.ipfsGateway + uri.replace('ipfs://', '');
   return uri;
 }
 
 async function fetchJson(url: string) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) return {};
+    return await res.json();
+  } catch {
+    return {};
+  }
+}
+
+function addrToTopic(addr: string) {
+  // 32-byte topic of an address
+  const a = addr.toLowerCase().replace(/^0x/, '');
+  return '0x' + a.padStart(64, '0');
+}
+
+function safeBigIntTopic(topic: string): bigint {
+  try {
+    return BigInt(topic);
+  } catch {
+    return 0n;
+  }
 }
 
 export default function Page() {
@@ -37,34 +64,40 @@ export default function Page() {
   const [selected, setSelected] = useState<bigint | null>(null);
 
   const [txPhase, setTxPhase] = useState<TxPhase>('idle');
-  const [status, setStatus] = useState<string>('Connect your wallet, then scan for your Midnight Moths.');
   const [txHash, setTxHash] = useState<string>('');
+  const [status, setStatus] = useState<string>('Connect your wallet, then scan for your Midnight Moths.');
 
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [hasEth, setHasEth] = useState(false);
 
   const shortWallet = wallet ? `${wallet.slice(0, 6)}…${wallet.slice(-4)}` : 'Not connected';
 
+  // Read-only Sonic provider for scanning/preview — does NOT depend on the wallet network.
   const sonicRpc = useMemo(() => new JsonRpcProvider(CHAINS.sonic.rpcUrl), []);
-  const nftRead = useMemo(() => new Contract(CONTRACTS.sonic.originalNft, ERC721_ABI, sonicRpc), [sonicRpc]);
-  const adapterRead = useMemo(() => new Contract(CONTRACTS.sonic.adapter, ONFT_ADAPTER_ABI, sonicRpc), [sonicRpc]);
-
-  async function refreshChainFromWallet() {
-    // @ts-ignore
-    const eth = typeof window !== 'undefined' ? window.ethereum : undefined;
-    if (!eth) return;
-    const cidHex: string = await eth.request({ method: 'eth_chainId' });
-    setChainId(parseInt(cidHex, 16));
-  }
+  const nftRead = useMemo(
+    () => new Contract(CONTRACTS.sonic.originalNft, ERC721_ABI, sonicRpc),
+    [sonicRpc]
+  );
+  const adapterRead = useMemo(
+    () => new Contract(CONTRACTS.sonic.adapter, ONFT_ADAPTER_ABI, sonicRpc),
+    [sonicRpc]
+  );
 
   useEffect(() => {
+    setHasEth(typeof window !== 'undefined' && !!(window as any)?.ethereum);
+
+    // Try to hydrate wallet+chain if already connected
     refreshChainFromWallet();
-    // @ts-ignore
-    const eth = typeof window !== 'undefined' ? window.ethereum : undefined;
-    if (!eth) return;
+
+    const eth = typeof window !== 'undefined' ? (window as any).ethereum : undefined;
+    if (!eth?.on) return;
+
     const onChainChanged = () => refreshChainFromWallet();
     const onAccountsChanged = (accs: string[]) => setWallet(accs?.[0] ? getAddress(accs[0]) : '');
-    eth.on?.('chainChanged', onChainChanged);
-    eth.on?.('accountsChanged', onAccountsChanged);
+
+    eth.on('chainChanged', onChainChanged);
+    eth.on('accountsChanged', onAccountsChanged);
+
     return () => {
       eth.removeListener?.('chainChanged', onChainChanged);
       eth.removeListener?.('accountsChanged', onAccountsChanged);
@@ -72,14 +105,71 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const getChainId = async (): Promise<number | null> => {
+    try {
+      const eth = (window as any).ethereum;
+      if (!eth?.request) return null;
+      const hex = await eth.request({ method: 'eth_chainId' });
+      if (typeof hex !== 'string') return null;
+      return parseInt(hex, 16);
+    } catch {
+      return null;
+    }
+  };
+
+  async function refreshChainFromWallet() {
+    const eth = typeof window !== 'undefined' ? (window as any).ethereum : undefined;
+    if (!eth?.request) return;
+
+    try {
+      const cidHex: string = await eth.request({ method: 'eth_chainId' });
+      const cId = parseInt(cidHex, 16);
+      setChainId(cId);
+
+      const accounts: string[] = await eth.request({ method: 'eth_accounts' });
+      if (accounts?.[0]) setWallet(getAddress(accounts[0]));
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  const switchToChain = async (targetChainId: number) => {
+    const eth = (window as any).ethereum;
+    if (!eth?.request) throw new Error('No injected wallet found.');
+    const chainIdHex = '0x' + targetChainId.toString(16);
+
+    try {
+      await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+    } catch (e: any) {
+      // 4902 = chain not added
+      if (e?.code === 4902 && targetChainId === CHAINS.sonic.chainId) {
+        await eth.request({
+          method: 'wallet_addEthereumChain',
+          params: [
+            {
+              chainId: chainIdHex,
+              chainName: 'Sonic',
+              nativeCurrency: { name: 'S', symbol: 'S', decimals: 18 },
+              rpcUrls: CHAINS.sonic.walletRpcUrls,
+              blockExplorerUrls: [CHAINS.sonic.explorer]
+            }
+          ]
+        });
+        await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+        return;
+      }
+      throw e;
+    }
+  };
+
   async function connect() {
-    // @ts-ignore
-    const eth = typeof window !== 'undefined' ? window.ethereum : undefined;
+    const eth = typeof window !== 'undefined' ? (window as any).ethereum : undefined;
     if (!eth) {
       setTxPhase('error');
-      setStatus('No injected wallet found. Install a wallet extension or use the Base app in-app wallet.');
+      setStatus('No injected wallet found. Open this in Coinbase Wallet / MetaMask / a wallet browser.');
       return;
     }
+
     try {
       const accounts: string[] = await eth.request({ method: 'eth_requestAccounts' });
       const addr = accounts?.[0] ? getAddress(accounts[0]) : '';
@@ -94,327 +184,292 @@ export default function Page() {
   }
 
   async function ensureSonic() {
-    // @ts-ignore
-    const eth = typeof window !== 'undefined' ? window.ethereum : undefined;
-    if (!eth) throw new Error('No injected wallet');
-    const cidHex: string = await eth.request({ method: 'eth_chainId' });
-    const cid = parseInt(cidHex, 16);
-    if (cid === CHAINS.sonic.chainId) return;
-
-    setTxPhase('switching');
-    setStatus('Switching wallet to Sonic…');
-
-    try {
-      await eth.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: CHAINS.sonic.chainIdHex }],
-      });
-    } catch (err: any) {
-      // If the chain hasn't been added to the wallet yet:
-      if (err?.code === 4902) {
-        await eth.request({
-          method: 'wallet_addEthereumChain',
-          params: [
-            {
-              chainId: CHAINS.sonic.chainIdHex,
-              chainName: 'Sonic',
-              rpcUrls: CHAINS.sonic.walletRpcUrls,
-              nativeCurrency: { name: 'S', symbol: 'S', decimals: 18 },
-              blockExplorerUrls: [CHAINS.sonic.explorer],
-            },
-          ],
-        });
-      } else {
-        throw err;
-      }
-    }
-
-    await refreshChainFromWallet();
-    setTxPhase('ready');
-    setStatus('Wallet is on Sonic. You can scan now.');
-  }
-
-  const ensureBase = async () => {
     if (!hasEth) {
-      setStatus('No injected wallet found. Please open in a wallet browser (Coinbase Wallet / MetaMask).');
+      setStatus('No injected wallet found. Open this in a wallet browser.');
       return;
     }
-    const eth = window.ethereum;
-    const cid = await getChainId(eth);
-    if (cid === CHAINS.base.chainId) return;
-
     setTxPhase('switching');
-    setStatus('Switching wallet to Base…');
-
     try {
-      await eth.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: CHAINS.base.chainIdHex }],
-      });
-    } catch (err: any) {
-      if (err?.code === 4902) {
-        await eth.request({
-          method: 'wallet_addEthereumChain',
-          params: [
-            {
-              chainId: CHAINS.base.chainIdHex,
-              chainName: 'Base',
-              rpcUrls: CHAINS.base.walletRpcUrls,
-              nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-              blockExplorerUrls: [CHAINS.base.explorer],
-            },
-          ],
-        });
-      } else {
-        throw err;
+      const cid = await getChainId();
+      if (cid !== CHAINS.sonic.chainId) {
+        await switchToChain(CHAINS.sonic.chainId);
+        await refreshChainFromWallet();
       }
-    }
-
-    await refreshChainFromWallet();
-    setTxPhase('ready');
-    setStatus('Wallet is on Base.');
-  }
-
-  async function loadPreview(tokenId: bigint) {
-    try {
-      const tokenURI: string = await nftRead.tokenURI(tokenId);
-      const meta = await fetchJson(ipfsToHttp(tokenURI));
-      const image = ipfsToHttp(meta?.image || meta?.image_url || '');
-      const name = meta?.name || `Midnight Moth #${tokenId.toString()}`;
-      setMoths((prev) =>
-        prev.map((m) => (m.tokenId === tokenId ? { ...m, tokenURI, image, name } : m)),
-      );
-    } catch {
-      // Preview is best-effort; don't block.
-    }
-  }
-
-  async function scanWallet() {
-    if (!wallet) {
+      setTxPhase('ready');
+      setStatus('Wallet is on Sonic. You can scan now.');
+    } catch (e: any) {
       setTxPhase('error');
-      setStatus('Connect your wallet first.');
+      setStatus(`Failed to switch: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  async function ensureBase() {
+    if (!hasEth) {
+      setStatus('No injected wallet found. Open this in a wallet browser.');
       return;
     }
+    setTxPhase('switching');
+    try {
+      const cid = await getChainId();
+      if (cid !== CHAINS.base.chainId) {
+        await switchToChain(CHAINS.base.chainId);
+        await refreshChainFromWallet();
+      }
+      setTxPhase('ready');
+      setStatus('Wallet is on Base.');
+    } catch (e: any) {
+      setTxPhase('error');
+      setStatus(`Failed to switch: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  async function loadOneMoth(id: bigint): Promise<MothItem> {
+    let uri = '';
+    try {
+      uri = await nftRead.tokenURI(id);
+    } catch {
+      uri = '';
+    }
+
+    let meta: any = {};
+    if (uri) meta = await fetchJson(ipfsToHttp(uri));
+
+    return {
+      tokenId: id,
+      tokenURI: uri || undefined,
+      name: typeof meta?.name === 'string' ? meta.name : undefined,
+      image: typeof meta?.image === 'string' ? ipfsToHttp(meta.image) : undefined
+    };
+  }
+
+  // Scan strategy:
+  // 1) Read balanceOf(wallet) from Sonic RPC.
+  // 2) Find candidate tokenIds by scanning Transfer(to=wallet) logs backwards until we have enough candidates.
+  // 3) Verify ownership via ownerOf for each candidate, then fetch tokenURI + metadata.
+  async function scanWallet() {
+    if (!wallet) return;
+
+    setTxPhase('scanning');
+    setStatus('Scanning Sonic for Midnight Moths...');
+    setMoths([]);
+    setSelected(null);
+    setTxHash('');
 
     try {
-      await ensureSonic();
-      setTxPhase('scanning');
-      setStatus('Scanning your wallet for Midnight Moths on Sonic…');
-      setTxHash('');
+      const normalizedWallet = getAddress(wallet);
+      const balanceBn = await nftRead.balanceOf(normalizedWallet);
+      const balance = Number(balanceBn);
 
-      // 1) Quick balance check (also validates that contract + RPC are correct)
-      const bal: bigint = await nftRead.balanceOf(wallet);
-      const balanceNum = Number(bal);
-      if (!Number.isFinite(balanceNum) || balanceNum <= 0) {
-        setMoths([]);
-        setSelected(null);
-        setTxPhase('ready');
-        setStatus('No Moths detected on Sonic for this wallet.');
+      if (balance === 0) {
+        setTxPhase('idle');
+        setStatus('No Midnight Moths found on Sonic in this wallet.');
         return;
       }
 
-      // 2) If contract supports ERC721Enumerable, use it (fast)
-      const enumerableAbi = [
-        { type: 'function', name: 'tokenOfOwnerByIndex', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }, { name: 'index', type: 'uint256' }], outputs: [{ name: 'tokenId', type: 'uint256' }] },
-      ] as const;
+      const latest = await sonicRpc.getBlockNumber();
+      const maxBlocks = UI.scanBlocks ?? 2500000;
+      const chunk = UI.scanChunkSize ?? 50000;
 
-      const nftEnum = new Contract(CONTRACTS.sonic.originalNft, [...(ERC721_ABI as any), ...enumerableAbi] as any, sonicRpc);
+      const toTopic = addrToTopic(normalizedWallet);
+      const candidates = new Set<string>();
 
-      const found: bigint[] = [];
+      setStatus(`You have ${balance} Moth(s). Searching recent transfers on Sonic...`);
 
-      try {
-        const max = Math.min(balanceNum, 50); // safety cap for UI
-        for (let i = 0; i < max; i++) {
-          const id: bigint = await nftEnum.tokenOfOwnerByIndex(wallet, i);
-          found.push(id);
-        }
-      } catch {
-        // 3) Fallback: scan Transfer logs for last N blocks and reconstruct ownership
-        const latest = await sonicRpc.getBlockNumber();
-        const start = Math.max(0, latest - UI.scanBlocks);
-        const chunk = UI.scanChunkSize;
+      let scanned = 0;
+      for (let end = latest; end >= 0 && scanned < maxBlocks && candidates.size < balance * 6; end -= chunk) {
+        const start = Math.max(0, end - chunk + 1);
 
-        const ownerTopic = zeroPadValue(wallet, 32).toLowerCase();
+        const logs = await sonicRpc.getLogs({
+          address: CONTRACTS.sonic.originalNft,
+          fromBlock: start,
+          toBlock: end,
+          topics: [TRANSFER_TOPIC, null, toTopic]
+        });
 
-        const tokenSet = new Set<string>();
-
-        // Scan incoming and outgoing logs in the same loop
-        for (let from = start; from <= latest; from += chunk) {
-          const to = Math.min(latest, from + chunk - 1);
-
-          const [inLogs, outLogs] = await Promise.all([
-            sonicRpc.getLogs({
-              address: CONTRACTS.sonic.originalNft,
-              fromBlock: from,
-              toBlock: to,
-              topics: [TRANSFER_SIG, null, ownerTopic],
-            }),
-            sonicRpc.getLogs({
-              address: CONTRACTS.sonic.originalNft,
-              fromBlock: from,
-              toBlock: to,
-              topics: [TRANSFER_SIG, ownerTopic, null],
-            }),
-          ]);
-
-          // ethers v6 Log type uses `index` (not `logIndex`). Some RPCs may still return `logIndex`.
-          const getIdx = (l: any) => (typeof l.index === 'number' ? l.index : typeof l.logIndex === 'number' ? l.logIndex : 0);
-          const logs = [...inLogs, ...outLogs].sort((a: any, b: any) => (a.blockNumber - b.blockNumber) || (getIdx(a) - getIdx(b)));
-
-
-          for (const log of logs) {
-            const fromAddr = ('0x' + log.topics[1].slice(26)).toLowerCase();
-            const toAddr = ('0x' + log.topics[2].slice(26)).toLowerCase();
-            const tokenId = BigInt(log.topics[3]);
-
-            if (toAddr === wallet.toLowerCase()) tokenSet.add(tokenId.toString());
-            if (fromAddr === wallet.toLowerCase()) tokenSet.delete(tokenId.toString());
-          }
+        for (const log of logs) {
+          const tokenTopic = log.topics?.[3];
+          if (!tokenTopic) continue;
+          const tokenId = safeBigIntTopic(tokenTopic);
+          if (tokenId > 0n) candidates.add(tokenId.toString());
         }
 
-        tokenSet.forEach((s) => found.push(BigInt(s)));
+        scanned += (end - start + 1);
+        if (candidates.size > 0) {
+          setStatus(`Found ${candidates.size} candidate token(s)… verifying ownership…`);
+        }
       }
 
-      found.sort((a, b) => (a < b ? -1 : 1));
-      const items: MothItem[] = found.map((id) => ({ tokenId: id }));
+      // If we didn't find anything (rare), we can still allow manual add.
+      if (candidates.size === 0) {
+        setTxPhase('idle');
+        setStatus('Scan found no candidate transfers. If you know a tokenId, add it manually.');
+        return;
+      }
+
+      const ids = Array.from(candidates).map((s) => BigInt(s)).sort((a, b) => (a > b ? -1 : 1));
+
+      const owned: bigint[] = [];
+      for (const id of ids) {
+        if (owned.length >= balance) break;
+        try {
+          const owner = await nftRead.ownerOf(id);
+          if (getAddress(owner) === normalizedWallet) owned.push(id);
+        } catch {
+          // token might not exist anymore / burned / etc
+        }
+      }
+
+      if (owned.length === 0) {
+        setTxPhase('idle');
+        setStatus('Could not verify any owned Moths from scan. Try adding a tokenId manually.');
+        return;
+      }
+
+      setStatus(`Verified ${owned.length} owned Moth(s). Loading previews…`);
+
+      const items: MothItem[] = [];
+      for (const id of owned) {
+        items.push(await loadOneMoth(id));
+      }
 
       setMoths(items);
-      setSelected(items[0]?.tokenId ?? null);
-
-      // Load previews for first ~12 for speed
-      await Promise.all(items.slice(0, 12).map((m) => loadPreview(m.tokenId)));
-
-      setTxPhase('ready');
-      setStatus(`Found ${items.length} Moth(s). Select one, approve (once), then send.`);
+      setTxPhase('idle');
+      setStatus(`Loaded ${items.length} Moth(s). Click one to preview + send.`);
     } catch (e: any) {
+      console.error(e);
       setTxPhase('error');
-      setStatus(`Scan failed: ${e?.message ?? String(e)}`);
+      setStatus(`Scan failed: ${e?.shortMessage ?? e?.message ?? String(e)}`);
     }
   }
 
   async function addManualToken() {
-    if (!wallet) {
-      setTxPhase('error');
-      setStatus('Connect your wallet first.');
-      return;
-    }
+    if (!wallet || !manualTokenId) return;
 
-    const raw = manualTokenId.trim();
-    if (!raw) return;
-
-    let tokenId: bigint;
-    try {
-      tokenId = BigInt(raw);
-    } catch {
-      setTxPhase('error');
-      setStatus('Token ID must be a number.');
-      return;
-    }
+    const normalizedWallet = getAddress(wallet);
 
     try {
-      await ensureSonic();
-      setTxPhase('scanning');
-      setStatus(`Checking ownership of token #${tokenId.toString()}…`);
-
-      const owner: string = await nftRead.ownerOf(tokenId);
-      if (owner.toLowerCase() !== wallet.toLowerCase()) {
-        setTxPhase('error');
-        setStatus(`That token is not owned by this wallet on Sonic. ownerOf() = ${owner}`);
+      const id = BigInt(manualTokenId.trim());
+      if (id < 0n) throw new Error('Invalid tokenId.');
+      if (moths.some((m) => m.tokenId === id)) {
+        setStatus(`Moth #${id.toString()} is already loaded.`);
+        setManualTokenId('');
         return;
       }
 
-      setMoths((prev) => {
-        const exists = prev.some((m) => m.tokenId === tokenId);
-        if (exists) return prev;
-        return [{ tokenId }, ...prev];
-      });
-      setSelected(tokenId);
-      await loadPreview(tokenId);
+      setStatus(`Checking ownership for token #${id.toString()}...`);
+      const owner = await nftRead.ownerOf(id);
+      if (getAddress(owner) !== normalizedWallet) {
+        setStatus(`You do not own Moth #${id.toString()} on Sonic (or token does not exist).`);
+        return;
+      }
 
-      setTxPhase('ready');
-      setStatus(`Added token #${tokenId.toString()}. You can approve + send.`);
+      const item = await loadOneMoth(id);
+      setMoths((prev) => [item, ...prev]);
+      setManualTokenId('');
+      setStatus(`Added Moth #${id.toString()}.`);
     } catch (e: any) {
-      setTxPhase('error');
-      setStatus(`Could not verify token on Sonic: ${e?.message ?? String(e)}`);
+      setStatus(`Could not verify tokenId on Sonic: ${e?.shortMessage ?? e?.message ?? String(e)}`);
     }
   }
 
+  function selectMoth(id: bigint) {
+    setSelected(id);
+    setStatus(`Selected Moth #${id.toString()}. Approve, then send.`);
+  }
+
   async function approveAdapter() {
-    if (!wallet) return;
+    if (!selected || !wallet) return;
+
+    // approvals must be done on Sonic in the wallet
+    await ensureSonic();
+
+    setTxPhase('approving');
+    setStatus('Checking approval on Sonic…');
+
     try {
-      await ensureSonic();
-      setTxPhase('approving');
-      setStatus('Approving the Adapter to move your Moths (one-time)…');
-      setTxHash('');
-
-      // @ts-ignore
-      const eth = window.ethereum;
-      const provider = new BrowserProvider(eth);
+      const provider = new BrowserProvider((window as any).ethereum);
       const signer = await provider.getSigner();
-
       const nftWrite = new Contract(CONTRACTS.sonic.originalNft, ERC721_ABI, signer);
-      const tx = await nftWrite.setApprovalForAll(CONTRACTS.sonic.adapter, true);
-      setTxHash(tx.hash);
-      await tx.wait();
+
+      const normalizedWallet = getAddress(wallet);
+      const approved = await nftWrite.isApprovedForAll(normalizedWallet, CONTRACTS.sonic.adapter);
+
+      if (!approved) {
+        setStatus('Confirm approval in your wallet…');
+        const tx = await nftWrite.setApprovalForAll(CONTRACTS.sonic.adapter, true);
+        setTxHash(tx.hash);
+        setStatus('Approving… waiting for confirmation…');
+        await tx.wait();
+      }
 
       setTxPhase('ready');
-      setStatus('Approved. Now select a Moth and send it to Base.');
+      setStatus('Adapter approved. You can send this Moth to Base.');
     } catch (e: any) {
       setTxPhase('error');
-      setStatus(`Approve failed: ${e?.message ?? String(e)}`);
+      setStatus(`Approval failed: ${e?.shortMessage ?? e?.message ?? String(e)}`);
     }
   }
 
   async function sendSelected() {
-    if (!wallet) return;
-    if (selected == null) {
-      setTxPhase('error');
-      setStatus('Select a Moth first.');
-      return;
-    }
+    if (selected == null || !wallet) return;
+
+    // sending must be done on Sonic in the wallet
+    await ensureSonic();
+
+    setTxHash('');
+    setTxPhase('quoting');
+    setStatus('Quoting LayerZero fee…');
 
     try {
-      await ensureSonic();
-      setTxPhase('quoting');
-      setStatus('Quoting LayerZero fee…');
-      setTxHash('');
+      const normalizedWallet = getAddress(wallet);
 
-      const toBytes32 = zeroPadValue(wallet, 32);
       const sendParam = {
         dstEid: CONTRACTS.layerzero.baseEid,
-        to: toBytes32,
+        to: zeroPadValue(normalizedWallet, 32), // bytes32 recipient
         tokenId: selected,
         extraOptions: '0x',
         composeMsg: '0x',
-        onftCmd: '0x',
+        onftCmd: '0x'
       };
 
-      // quoteSend returns (MessagingFee fee, MessagingReceipt receipt?) depending on contract;
-      // our adapter ABI returns MessagingFee with nativeFee.
-      const fee = await adapterRead.quoteSend(sendParam, false);
-      const nativeFee: bigint = fee?.nativeFee ?? fee?.[0] ?? 0n;
+      const quote = await adapterRead.quoteSend(sendParam, false);
+      const nativeFee: bigint = quote.nativeFee ?? quote[0];
+      const lzTokenFee: bigint = quote.lzTokenFee ?? quote[1];
 
       setTxPhase('sending');
-      setStatus(`Sending Moth #${selected.toString()}…`);
-      // @ts-ignore
-      const eth = window.ethereum;
-      const provider = new BrowserProvider(eth);
+      setStatus('Confirm the send transaction in your wallet…');
+
+      const provider = new BrowserProvider((window as any).ethereum);
       const signer = await provider.getSigner();
       const adapterWrite = new Contract(CONTRACTS.sonic.adapter, ONFT_ADAPTER_ABI, signer);
 
-      const tx = await adapterWrite.sendFrom(wallet, sendParam, { value: nativeFee });
+      const tx = await adapterWrite.sendFrom(
+        normalizedWallet,
+        sendParam,
+        { nativeFee, lzTokenFee },
+        normalizedWallet,
+        { value: nativeFee }
+      );
+
       setTxHash(tx.hash);
+      setStatus('Sent. Waiting for confirmation…');
       await tx.wait();
 
       setTxPhase('success');
-      setStatus(`Sent! Moth #${selected.toString()} is on the way to Base. (It may take a moment to finalize.)`);
+      setStatus(`Sent! Moth #${selected.toString()} is bridging to Base. It can take a minute.`);
+
+      setMoths((prev) => prev.filter((m) => m.tokenId !== selected));
+      setSelected(null);
     } catch (e: any) {
       setTxPhase('error');
       setStatus(`Send failed: ${e?.shortMessage ?? e?.message ?? String(e)}`);
     }
   }
 
-  const selectedItem = useMemo(() => (selected == null ? null : moths.find((m) => m.tokenId === selected) || null), [moths, selected]);
+  const selectedItem = useMemo(
+    () => (selected == null ? null : moths.find((m) => m.tokenId === selected) || null),
+    [moths, selected]
+  );
 
   return (
     <main className="wrap">
@@ -440,24 +495,24 @@ export default function Page() {
             <span className="dot blueDot" />
             <strong>Network</strong>
             <span className="mono">
-              {chainId === CHAINS.sonic.chainId ? 'Sonic (146)' : chainId === CHAINS.base.chainId ? 'Base (8453)' : (chainId ?? '—')}
+              {chainId === CHAINS.sonic.chainId
+                ? 'Sonic (146)'
+                : chainId === CHAINS.base.chainId
+                ? 'Base (8453)'
+                : chainId ?? '—'}
             </span>
           </div>
 
           {!wallet ? (
-            <button className="btn primary" onClick={connect}>Connect</button>
+            <button className="btn primary" onClick={connect}>
+              Connect
+            </button>
           ) : (
-            <div className="switchRow">
-              <button
-                className={`btn ${chainId === CHAINS.sonic.chainId ? 'primary' : ''}`}
-                onClick={ensureSonic}
-              >
+            <div className="switchRow" style={{ display: 'flex', gap: 10 }}>
+              <button className={`btn ${chainId === CHAINS.sonic.chainId ? 'primary' : ''}`} onClick={ensureSonic}>
                 Switch to Sonic
               </button>
-              <button
-                className={`btn ${chainId === CHAINS.base.chainId ? 'primary' : ''}`}
-                onClick={ensureBase}
-              >
+              <button className={`btn ${chainId === CHAINS.base.chainId ? 'primary' : ''}`} onClick={ensureBase}>
                 Switch to Base
               </button>
             </div>
@@ -476,10 +531,14 @@ export default function Page() {
             </div>
           </div>
 
-          <p className="muted">Scan your wallet on Sonic. If scan misses something, add a tokenId manually.</p>
+          <p className="muted">Scan your wallet on Sonic (read-only). If scan misses something, add a tokenId manually.</p>
 
           <div className="row">
-            <button className="btn primary" onClick={scanWallet} disabled={!wallet || txPhase === 'scanning' || txPhase === 'switching'}>
+            <button
+              className="btn primary"
+              onClick={scanWallet}
+              disabled={!wallet || txPhase === 'scanning' || txPhase === 'switching'}
+            >
               {txPhase === 'scanning' ? 'Scanning…' : 'Scan wallet'}
             </button>
 
@@ -499,16 +558,34 @@ export default function Page() {
           {showAdvanced && (
             <div className="advanced">
               <div className="advRow">
-                <div><span className="label">Sonic NFT</span><span className="mono">{CONTRACTS.sonic.originalNft}</span></div>
+                <div>
+                  <span className="label">Sonic RPC</span>
+                  <span className="mono">{CHAINS.sonic.rpcUrl}</span>
+                </div>
               </div>
               <div className="advRow">
-                <div><span className="label">Sonic Adapter</span><span className="mono">{CONTRACTS.sonic.adapter}</span></div>
+                <div>
+                  <span className="label">Sonic NFT</span>
+                  <span className="mono">{CONTRACTS.sonic.originalNft}</span>
+                </div>
               </div>
               <div className="advRow">
-                <div><span className="label">Base Mirror NFT</span><span className="mono">{CONTRACTS.base.mirrorNft}</span></div>
+                <div>
+                  <span className="label">Sonic Adapter</span>
+                  <span className="mono">{CONTRACTS.sonic.adapter}</span>
+                </div>
               </div>
               <div className="advRow">
-                <div><span className="label">Destination EID</span><span className="mono">{String(CONTRACTS.layerzero.baseEid)}</span></div>
+                <div>
+                  <span className="label">Base Mirror NFT</span>
+                  <span className="mono">{CONTRACTS.base.mirrorNft}</span>
+                </div>
+              </div>
+              <div className="advRow">
+                <div>
+                  <span className="label">Destination EID</span>
+                  <span className="mono">{String(CONTRACTS.layerzero.baseEid)}</span>
+                </div>
               </div>
             </div>
           )}
@@ -522,7 +599,11 @@ export default function Page() {
               moths.map((m) => {
                 const active = selected === m.tokenId;
                 return (
-                  <button key={m.tokenId.toString()} className={`item ${active ? 'active' : ''}`} onClick={() => { setSelected(m.tokenId); loadPreview(m.tokenId); }}>
+                  <button
+                    key={m.tokenId.toString()}
+                    className={`item ${active ? 'active' : ''}`}
+                    onClick={() => selectMoth(m.tokenId)}
+                  >
                     <div className="thumb">
                       {m.image ? <img src={m.image} alt="" /> : <div className="thumbPh" />}
                     </div>
@@ -546,17 +627,38 @@ export default function Page() {
           {selectedItem ? (
             <div className="preview">
               <div className="bigThumb">
-                {selectedItem.image ? <img src={selectedItem.image} alt={selectedItem.name || ''} /> : <div className="bigPh">No preview yet</div>}
+                {selectedItem.image ? (
+                  <img src={selectedItem.image} alt={selectedItem.name || ''} />
+                ) : (
+                  <div className="bigPh">No preview</div>
+                )}
               </div>
               <div className="previewMeta">
                 <div className="title">{selectedItem.name || `Midnight Moth #${selectedItem.tokenId.toString()}`}</div>
                 <div className="mono smallMuted">Sonic → Base • Token #{selectedItem.tokenId.toString()}</div>
 
                 <div className="actions">
-                  <button className="btn" onClick={approveAdapter} disabled={!wallet || txPhase === 'approving' || txPhase === 'switching' || txPhase === 'scanning'}>
+                  <button
+                    className="btn"
+                    onClick={approveAdapter}
+                    disabled={
+                      !wallet || txPhase === 'approving' || txPhase === 'switching' || txPhase === 'scanning'
+                    }
+                  >
                     {txPhase === 'approving' ? 'Approving…' : 'Approve Adapter'}
                   </button>
-                  <button className="btn primary" onClick={sendSelected} disabled={!wallet || txPhase === 'sending' || txPhase === 'quoting' || txPhase === 'approving' || txPhase === 'switching' || txPhase === 'scanning'}>
+                  <button
+                    className="btn primary"
+                    onClick={sendSelected}
+                    disabled={
+                      !wallet ||
+                      txPhase === 'sending' ||
+                      txPhase === 'quoting' ||
+                      txPhase === 'approving' ||
+                      txPhase === 'switching' ||
+                      txPhase === 'scanning'
+                    }
+                  >
                     {txPhase === 'quoting' ? 'Quoting…' : txPhase === 'sending' ? 'Sending…' : 'Send to Base'}
                   </button>
                 </div>
